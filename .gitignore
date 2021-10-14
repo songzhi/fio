@@ -2,6 +2,7 @@
 *.o
 *.so
 *.exe
+libfio.a
 /.depend
 /FIO-VERSION-FILE
 /config-host.h
