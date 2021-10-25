@@ -1542,8 +1542,10 @@ static void handle_start(struct fio_client *client, struct fio_net_cmd *cmd)
 
 static void handle_stop(struct fio_client *client)
 {
-	if (client->error)
-		log_info("client <%s>: exited with error %d\n", client->hostname, client->error);
+	if (client->error == EBUSY) {
+		log_info("there's another client running, try again later\n");
+	} else if (client->error)
+		log_info("client <%s>: exited with error: %s\n", client->hostname, strerror(client->error));
 }
 
 static void convert_stop(struct fio_net_cmd *cmd)

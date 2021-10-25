@@ -1,3 +1,6 @@
+#include "log.h"
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -68,7 +71,7 @@ struct fio_fork_item {
 	int exitval;
 	int signal;
 	int exited;
-	pid_t pid;
+	pthread_t thread;
 };
 
 struct cmd_reply {
@@ -651,7 +654,7 @@ static int fio_net_queue_stop(int error, int signal)
 	return fio_net_send_ack(NULL, error, signal);
 }
 
-static void fio_server_add_fork_item(pid_t pid, struct flist_head *list)
+static void fio_server_add_fork_item(pthread_t thread, struct flist_head *list)
 {
 	struct fio_fork_item *ffi;
 
@@ -659,49 +662,35 @@ static void fio_server_add_fork_item(pid_t pid, struct flist_head *list)
 	ffi->exitval = 0;
 	ffi->signal = 0;
 	ffi->exited = 0;
-	ffi->pid = pid;
+	ffi->thread = thread;
 	flist_add_tail(&ffi->list, list);
 }
 
-static void fio_server_add_conn_pid(struct flist_head *conn_list, pid_t pid)
+static void fio_server_add_conn_thread(struct flist_head *conn_list, pthread_t thread)
 {
-	dprint(FD_NET, "server: forked off connection job (pid=%u)\n", (int) pid);
-	fio_server_add_fork_item(pid, conn_list);
+	dprint(FD_NET, "server: created connection thread (%lx)\n", thread);
+	fio_server_add_fork_item(thread, conn_list);
 }
 
-static void fio_server_add_job_pid(struct flist_head *job_list, pid_t pid)
+static void fio_server_add_job_thread(struct flist_head *job_list, pthread_t thread)
 {
-	dprint(FD_NET, "server: forked off job job (pid=%u)\n", (int) pid);
-	fio_server_add_fork_item(pid, job_list);
+	dprint(FD_NET, "server: created job thread (%lx)\n", thread);
+	fio_server_add_fork_item(thread, job_list);
 }
 
 static void fio_server_check_fork_item(struct fio_fork_item *ffi)
 {
-	int ret, status;
-
-	ret = waitpid(ffi->pid, &status, WNOHANG);
-	if (ret < 0) {
-		if (errno == ECHILD) {
-			log_err("fio: connection pid %u disappeared\n", (int) ffi->pid);
-			ffi->exited = 1;
-		} else
-			log_err("fio: waitpid: %s\n", strerror(errno));
-	} else if (ret == ffi->pid) {
-		if (WIFSIGNALED(status)) {
-			ffi->signal = WTERMSIG(status);
-			ffi->exited = 1;
-		}
-		if (WIFEXITED(status)) {
-			if (WEXITSTATUS(status))
-				ffi->exitval = WEXITSTATUS(status);
-			ffi->exited = 1;
-		}
+	void* ret;
+	if (pthread_tryjoin_np(ffi->thread, &ret) == 0) {
+		ffi->exited = true;
+		ffi->exitval = *(int*)ret;
+		free(ret);
 	}
 }
 
 static void fio_server_fork_item_done(struct fio_fork_item *ffi, bool stop)
 {
-	dprint(FD_NET, "pid %u exited, sig=%u, exitval=%d\n", (int) ffi->pid, ffi->signal, ffi->exitval);
+	dprint(FD_NET, "thread %lx exited, sig=%u, exitval=%d\n", ffi->thread, ffi->signal, ffi->exitval);
 
 	/*
 	 * Fold STOP and QUIT...
@@ -762,27 +751,26 @@ static int handle_load_file_cmd(struct fio_net_cmd *cmd)
 	return 0;
 }
 
-static int handle_run_cmd(struct sk_out *sk_out, struct flist_head *job_list,
-			  struct fio_net_cmd *cmd)
+static void *job_thread_main(void *data)
 {
-	pid_t pid;
-	int ret;
-
+	struct sk_out *sk_out = data;
 	sk_out_assign(sk_out);
+	int *ret = calloc(1, sizeof(ret));
+	*ret = fio_backend(sk_out);
+	sk_out_drop();
+	return ret;
+}
 
+static int handle_run_cmd(struct sk_out *sk_out, struct flist_head *job_list, struct fio_net_cmd *cmd)
+{
 	fio_time_init();
 	set_genesis_time();
 
-	pid = fork();
-	if (pid) {
-		fio_server_add_job_pid(job_list, pid);
-		return 0;
-	}
+	pthread_t tid;
+	pthread_create(&tid, NULL, job_thread_main, sk_out);
+	fio_server_add_job_thread(job_list, tid);
 
-	ret = fio_backend(sk_out);
-	free_threads_shm();
-	sk_out_drop();
-	_exit(ret);
+	return 0;
 }
 
 static int handle_job_cmd(struct fio_net_cmd *cmd)
@@ -1260,7 +1248,7 @@ static int handle_connection(struct sk_out *sk_out)
 	close(sk_out->sk);
 	sk_out->sk = -1;
 	__sk_out_drop(sk_out);
-	_exit(ret);
+	return ret;
 }
 
 /* get the address on this host bound by the input socket,
@@ -1300,6 +1288,34 @@ static int get_my_addr_str(int sk)
 	return 0;
 }
 
+static void *connection_thread_main(void *data)
+{
+	static atomic_bool HAS_CONNECTION = false;
+
+	struct sk_out *sk_out = data;
+	sk_out_assign(sk_out);
+	int *ret = calloc(1, sizeof(int));
+
+	bool expected = false;
+	if (!atomic_compare_exchange_strong(&HAS_CONNECTION, &expected, true)) {
+		*ret = -1;
+		fio_net_queue_stop(EBUSY, 0);
+		fio_net_queue_quit();
+		handle_xmits(sk_out);
+		sleep(1);
+		close(sk_out->sk);
+		sk_out->sk = -1;
+		__sk_out_drop(sk_out);
+		return ret;
+	}
+
+	*ret = handle_connection(sk_out);
+	reset_fio_state();
+	atomic_store(&HAS_CONNECTION, false);
+
+	return ret;
+}
+
 static int accept_loop(int listen_sk)
 {
 	struct sockaddr_in addr;
@@ -1317,7 +1333,6 @@ static int accept_loop(int listen_sk)
 		struct sk_out *sk_out;
 		const char *from;
 		char buf[64];
-		pid_t pid;
 
 		pfd.fd = listen_sk;
 		pfd.events = POLLIN;
@@ -1376,22 +1391,12 @@ static int accept_loop(int listen_sk)
 		__fio_sem_init(&sk_out->wait, FIO_SEM_LOCKED);
 		__fio_sem_init(&sk_out->xmit, FIO_SEM_UNLOCKED);
 
-		pid = fork();
-		if (pid) {
-			close(sk);
-			fio_server_add_conn_pid(&conn_list, pid);
-			continue;
-		}
+		pthread_t tid;
+		pthread_create(&tid, NULL, connection_thread_main, sk_out);
+		fio_server_add_conn_thread(&conn_list, tid);
 
 		/* if error, it's already logged, non-fatal */
 		get_my_addr_str(sk);
-
-		/*
-		 * Assign sk_out here, it'll be dropped in handle_connection()
-		 * since that function calls _exit() when done
-		 */
-		sk_out_assign(sk_out);
-		handle_connection(sk_out);
 	}
 
 	return exitval;
@@ -2511,124 +2516,13 @@ static int fio_server(void)
 
 void fio_server_got_signal(int signal)
 {
-	struct sk_out *sk_out = pthread_getspecific(sk_out_key);
-
-	assert(sk_out);
-
-	if (signal == SIGPIPE)
-		sk_out->sk = -1;
-	else {
-		log_info("\nfio: terminating on signal %d\n", signal);
-		exit_backend = true;
-	}
+	log_info("\nfio: terminating on signal %d\n", signal);
+	exit_backend = true;
 }
 
-static int check_existing_pidfile(const char *pidfile)
-{
-	struct stat sb;
-	char buf[16];
-	pid_t pid;
-	FILE *f;
-
-	if (stat(pidfile, &sb))
-		return 0;
-
-	f = fopen(pidfile, "r");
-	if (!f)
-		return 0;
-
-	if (fread(buf, sb.st_size, 1, f) <= 0) {
-		fclose(f);
-		return 1;
-	}
-	fclose(f);
-
-	pid = atoi(buf);
-	if (kill(pid, SIGCONT) < 0)
-		return errno != ESRCH;
-
-	return 1;
-}
-
-static int write_pid(pid_t pid, const char *pidfile)
-{
-	FILE *fpid;
-
-	fpid = fopen(pidfile, "w");
-	if (!fpid) {
-		log_err("fio: failed opening pid file %s\n", pidfile);
-		return 1;
-	}
-
-	fprintf(fpid, "%u\n", (unsigned int) pid);
-	fclose(fpid);
-	return 0;
-}
-
-/*
- * If pidfile is specified, background us.
- */
 int fio_start_server(char *pidfile)
 {
-	FILE *file;
-	pid_t pid;
-	int ret;
-
-#if defined(WIN32)
-	WSADATA wsd;
-	WSAStartup(MAKEWORD(2, 2), &wsd);
-#endif
-
-	if (!pidfile)
-		return fio_server();
-
-	if (check_existing_pidfile(pidfile)) {
-		log_err("fio: pidfile %s exists and server appears alive\n",
-								pidfile);
-		free(pidfile);
-		return -1;
-	}
-
-	pid = fork();
-	if (pid < 0) {
-		log_err("fio: failed server fork: %s\n", strerror(errno));
-		free(pidfile);
-		return -1;
-	} else if (pid) {
-		ret = write_pid(pid, pidfile);
-		free(pidfile);
-		_exit(ret);
-	}
-
-	setsid();
-	openlog("fio", LOG_NDELAY|LOG_NOWAIT|LOG_PID, LOG_USER);
-	log_syslog = true;
-
-	file = freopen("/dev/null", "r", stdin);
-	if (!file)
-		perror("freopen");
-
-	file = freopen("/dev/null", "w", stdout);
-	if (!file)
-		perror("freopen");
-
-	file = freopen("/dev/null", "w", stderr);
-	if (!file)
-		perror("freopen");
-
-	f_out = NULL;
-	f_err = NULL;
-
-	ret = fio_server();
-
-	fclose(stdin);
-	fclose(stdout);
-	fclose(stderr);
-
-	closelog();
-	unlink(pidfile);
-	free(pidfile);
-	return ret;
+	return fio_server();
 }
 
 void fio_server_set_arg(const char *arg)
